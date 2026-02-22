@@ -1,0 +1,65 @@
+@startuml
+title MES — Изменение статуса заказа: запись + инвалидация кеша
+
+actor Operator as Op
+participant "MES Web UI\n(Браузер)" as Web
+participant "MES API\n(OrdersController)" as Api
+queue "Event Bus\n(RabbitMQ)" as Bus
+participant "CacheService" as Cache
+database "Redis" as Redis
+database "SQL (Primary)" as DBPrimary
+
+note over Cache,Redis
+Ключи списков:
+- mes:orders:list:{status}:v{status_version}:{page}:{filter_hash}
+Счетчики:
+- mes:orders:count:{status}
+Версии сегментов:
+- status_version:{status}
+TTL: списки 30–60 c, счетчики 15–30 c
+end note
+
+== Изменение статуса заказа ==
+Op -> Web: Изменить статус заказа
+Web -> Api: PATCH /orders/{id}/status {new_status}
+Api -> DBPrimary: Применить новый статус\nUPDATE orders SET status=new_status WHERE id=...
+DBPrimary --> Api: OK
+Api -> Bus: Publish OrderStatusChanged {order_id, old_status, new_status, occurred_at}
+Api --> Web: 200 OK
+
+Bus -> Cache: Consume OrderStatusChanged
+
+' Инвалидация счетчиков
+opt Обновление счетчиков
+  Cache -> Redis: GET mes:orders:count:{old_status}
+  Cache -> Redis: GET mes:orders:count:{new_status}
+  alt Cache Hit
+    Cache -> Redis: DECR mes:orders:count:{old_status}
+    Cache -> Redis: INCR mes:orders:count:{new_status}
+  else Cache Miss
+    Cache -> Redis: none
+  end
+end
+
+opt Инвалидация списка заказов
+  Cache -> Redis: GET mes:orders:list:{old_status}
+  Cache -> Redis: GET mes:orders:list:{new_status}
+  alt Cache Hit
+    Cache -> Redis: DEL mes:orders:count:{old_status}
+    Cache -> Redis: DEL mes:orders:count:{new_status}
+  else Cache Miss
+    Cache -> Redis: none
+  end
+end
+
+Cache -> Redis: Инвалидация последних заказов DEL mes:orders:recent:page=1
+
+legend right
+Участники кеширования:
+- CacheService (формирование ключей, TTL)
+- Redis (in-memory хранилище)
+- SQL Primary — запись статуса; чтение после инвалидации может идти к replica
+- Event Bus (RabbitMQ) — доставка OrderStatusChanged
+end legend
+
+@enduml
